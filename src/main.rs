@@ -1,5 +1,6 @@
 mod redis_pool;
 mod modules;
+use crate::modules::coordinate_converter::batch_homography_all_cameras;
 
 use redis_pool::RedisPool;
 use std::sync::Arc;
@@ -43,8 +44,7 @@ async fn main() {
             let mut pipeline = MessagePipeline::new(msg);
             pipeline
                 .parse()
-                .filter();
-            // Insert more pipeline steps here in the future, e.g. pipeline.filter(), pipeline.transform()
+                .coordinate_convert();
             if pipeline.result.success {
                 let out_msg = pipeline.to_json();
                 pool_c.publish(&output_stream_c, &out_msg).await;
@@ -79,8 +79,12 @@ impl MessagePipeline {
         self
     }
 
-    fn filter(&mut self) -> &mut Self {
-        self.result = parse_message(&self.raw, &mut self.objects, &mut self.apriltags);
+    fn coordinate_convert(&mut self) -> &mut Self {
+        // Example: extract matrices and points from objects/apriltags if available
+        // This is a placeholder for actual extraction logic
+        let matrices = [];
+        let points = [];
+        let converted = crate::modules::coordinate_converter::batch_homography_all_cameras(&matrices, &points);
         self
     }
 
