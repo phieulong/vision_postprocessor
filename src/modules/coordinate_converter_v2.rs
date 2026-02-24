@@ -1,6 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use rayon::prelude::*;
+use std::error::Error;
+use std::fs::File;
+use std::path::Path;
+use ndarray::{Array1, Array2};
+use ndarray_npy::read_npy;
+use serde::Deserialize;
 
 pub struct CameraCalibration {
     pub fx: f32,
@@ -21,6 +27,13 @@ pub struct CameraCalibration {
 
 pub struct UndistortionManager {
     pub calibrations: HashMap<i32, CameraCalibration>,
+}
+
+#[derive(Deserialize)]
+struct UndistortionEntry {
+    camera_id: i32,
+    camera_matrix_path: String,
+    dist_coeffs_path: String,
 }
 
 impl UndistortionManager {
@@ -76,10 +89,56 @@ impl UndistortionManager {
         }
         out
     }
+
+    /// Load undistortion configuration from a JSON file listing camera entries and loading camera matrix and dist coeffs from .npy files.
+    /// JSON format: [{"camera_id":0,"camera_matrix_path":"/path/camera_matrix.npy","dist_coeffs_path":"/path/dist_coeffs.npy"}, ...]
+    pub fn from_npy_config<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn Error>> {
+        let file = File::open(path)?;
+        let entries: Vec<UndistortionEntry> = serde_json::from_reader(file)?;
+        let mut mgr = UndistortionManager::new();
+        for entry in entries {
+            // read 3x3 camera matrix
+            let cm_array: Array2<f64> = read_npy(entry.camera_matrix_path.clone())?;
+            if cm_array.len() != 9 {
+                return Err(format!("camera_matrix at {} is not 3x3", entry.camera_matrix_path).into());
+            }
+            let cm = cm_array;
+            // read dist coeffs (assume length >= 5)
+            let dist_array: Array1<f64> = read_npy(entry.dist_coeffs_path.clone())?;
+            if dist_array.len() < 5 {
+                return Err(format!("dist_coeffs at {} has length < 5", entry.dist_coeffs_path).into());
+            }
+            let dist = dist_array;
+            // populate CameraCalibration: map values and set projection to same as camera matrix by default
+            let fx = cm[[0,0]] as f32;
+            let fy = cm[[1,1]] as f32;
+            let cx = cm[[0,2]] as f32;
+            let cy = cm[[1,2]] as f32;
+            let fx_p = fx;
+            let fy_p = fy;
+            let cx_p = cx;
+            let cy_p = cy;
+            let k1 = dist[0] as f32;
+            let k2 = dist[1] as f32;
+            let p1 = dist[2] as f32;
+            let p2 = dist[3] as f32;
+            let k3 = dist.get(4usize).cloned().unwrap_or(0.0) as f32;
+            mgr.set_calibration(entry.camera_id, CameraCalibration {
+                fx, fy, cx, cy, fx_p, fy_p, cx_p, cy_p, k1, k2, p1, p2, k3, has_new_matrix: false
+            });
+        }
+        Ok(mgr)
+    }
 }
 
 pub struct HomographyManager {
     pub homographies: HashMap<i32, [[f64; 3]; 3]>,
+}
+
+#[derive(Deserialize)]
+struct HomographyEntry {
+    camera_id: i32,
+    homography_path: String,
 }
 
 impl HomographyManager {
@@ -95,6 +154,28 @@ impl HomographyManager {
     pub fn get_homography(&self, camera_id: i32) -> Option<&[[f64; 3]; 3]> {
         self.homographies.get(&camera_id)
     }
+
+    /// Load homography config (JSON array of objects with camera_id and homography_path) and read .npy matrices.
+    pub fn from_npy_config<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn Error>> {
+        let file = File::open(path)?;
+        let entries: Vec<HomographyEntry> = serde_json::from_reader(file)?;
+        let mut mgr = HomographyManager::new();
+        for entry in entries {
+            let hm_array: Array2<f64> = read_npy(entry.homography_path.clone())?;
+            if hm_array.len() != 9 {
+                return Err(format!("homography at {} is not 3x3", entry.homography_path).into());
+            }
+            let hm = hm_array;
+            let mut mat = [[0.0f64; 3]; 3];
+            for i in 0..3 {
+                for j in 0..3 {
+                    mat[i][j] = hm[[i,j]];
+                }
+            }
+            mgr.set_homography(entry.camera_id, mat);
+        }
+        Ok(mgr)
+    }
 }
 
 /// Converts pixel coordinates to real-world coordinates using undistortion and homography.
@@ -104,11 +185,13 @@ pub struct CoordinateConverter {
 }
 
 impl CoordinateConverter {
-    pub fn new(undistortion_manager: Arc<UndistortionManager>, homography_manager: Arc<HomographyManager>) -> Self {
-        Self {
+    pub fn new<P: AsRef<Path>>(undistortion_config_path: P, homography_config_path: P) -> Result<Self, Box<dyn Error>> {
+        let undistortion_manager = Arc::new(UndistortionManager::from_npy_config(undistortion_config_path)?);
+        let homography_manager = Arc::new(HomographyManager::from_npy_config(homography_config_path)?);
+        Ok(Self {
             undistortion_manager,
             homography_manager,
-        }
+        })
     }
 
     /// Convert a batch of pixel points to real-world coordinates for a given camera.
@@ -140,26 +223,35 @@ impl CoordinateConverter {
 
     /// Parallel conversion for all objects' pixel coordinates to real-world coordinates, grouped by camera.
     pub fn convert_batch_objects(&self, objects: &mut [crate::ObjectData]) {
+        self.convert_batch_generic(objects);
+    }
+
+    /// Parallel conversion for all AprilTag pixel coordinates to real-world coordinates, grouped by camera.
+    pub fn convert_batch_apriltags(&self, tags: &mut [crate::AprilTagData]) {
+        self.convert_batch_generic(tags);
+    }
+
+    fn convert_batch_generic<T: crate::modules::ConvertibleData + Sync + Send>(&self, items: &mut [T]) {
         use std::collections::HashMap;
         // Step 1: Prepare pixel data for each camera group
         // camera_groups: (camera_id, global_indices, points_pixel, local_index_for_each_point, point_type)
         let mut camera_groups: Vec<(i32, Vec<usize>, Vec<[f32; 2]>, Vec<usize>, Vec<u8>)> = Vec::new();
         let mut camera_indices: HashMap<i32, Vec<usize>> = HashMap::new();
-        for (i, obj) in objects.iter().enumerate() {
-            camera_indices.entry(obj.camera_id).or_default().push(i);
+        for (i, item) in items.iter().enumerate() {
+            camera_indices.entry(item.camera_id()).or_default().push(i);
         }
         for (cam_id, indices) in camera_indices.iter() {
-            let num_objects = indices.len();
-            let num_points = num_objects * 5;
+            let num_items = indices.len();
+            let num_points = num_items * 5;
             let mut points_pixel_copy: Vec<[f32; 2]> = Vec::with_capacity(num_points);
             let mut point_to_local_index: Vec<usize> = Vec::with_capacity(num_points);
             let mut point_type_copy: Vec<u8> = Vec::with_capacity(num_points);
             for (local_idx, &global_idx) in indices.iter().enumerate() {
-                let obj = &objects[global_idx];
-                points_pixel_copy.push(obj.center_pixel);
+                let item = &items[global_idx];
+                points_pixel_copy.push(item.center_pixel());
                 point_to_local_index.push(local_idx);
                 point_type_copy.push(0);
-                for (c, &corner) in obj.corners_pixel.iter().enumerate() {
+                for (c, &corner) in item.corners_pixel().iter().enumerate() {
                     points_pixel_copy.push(corner);
                     point_to_local_index.push(local_idx);
                     point_type_copy.push((c + 1) as u8);
@@ -167,14 +259,13 @@ impl CoordinateConverter {
             }
             camera_groups.push((*cam_id, indices.clone(), points_pixel_copy, point_to_local_index, point_type_copy));
         }
-        // Step 2: Parallel conversion per camera (no nested parallelism inside convert_points)
+        // Step 2: Parallel conversion per camera
         let updates: Vec<(usize, Option<[f32; 2]>, Option<[[f32; 2]; 4]>)> = camera_groups.into_par_iter()
             .map(|(cam_id, global_indices, points_pixel_copy, point_to_local_index, point_type_copy)| {
                 let points_real = self.convert_points(cam_id, &points_pixel_copy);
-                let num_objects = global_indices.len();
-                // Use index-based vectors to collect centers and corners per local object index
-                let mut centers: Vec<Option<[f32; 2]>> = vec![None; num_objects];
-                let mut corners: Vec<Option<[[f32; 2]; 4]>> = vec![None; num_objects];
+                let num_items = global_indices.len();
+                let mut centers: Vec<Option<[f32; 2]>> = vec![None; num_items];
+                let mut corners: Vec<Option<[[f32; 2]; 4]>> = vec![None; num_items];
                 for (i, &local_idx) in point_to_local_index.iter().enumerate() {
                     let t = point_type_copy[i];
                     let real = points_real[i];
@@ -187,7 +278,7 @@ impl CoordinateConverter {
                         corners[local_idx].as_mut().unwrap()[(t - 1) as usize] = [real[0] as f32, real[1] as f32];
                     }
                 }
-                let mut result = Vec::with_capacity(num_objects);
+                let mut result = Vec::with_capacity(num_items);
                 for (local_idx, &global_idx) in global_indices.iter().enumerate() {
                     let center = centers[local_idx];
                     let corner = corners[local_idx];
@@ -201,79 +292,7 @@ impl CoordinateConverter {
             .collect();
         // Step 3: Sequentially apply updates
         for (idx, center, corners) in updates {
-            if let Some(c) = center {
-                objects[idx].center_real = Some(c);
-            }
-            if let Some(c) = corners {
-                objects[idx].corners_real = Some(c);
-            }
-        }
-    }
-
-    /// Parallel conversion for all AprilTag pixel coordinates to real-world coordinates, grouped by camera.
-    pub fn convert_batch_apriltags(&self, tags: &mut [crate::AprilTagData]) {
-        use std::collections::HashMap;
-        let mut camera_groups: Vec<(i32, Vec<usize>, Vec<[f32; 2]>, Vec<usize>, Vec<u8>)> = Vec::new();
-        let mut camera_indices: HashMap<i32, Vec<usize>> = HashMap::new();
-        for (i, tag) in tags.iter().enumerate() {
-            camera_indices.entry(tag.camera_id).or_default().push(i);
-        }
-        for (cam_id, indices) in camera_indices.iter() {
-            let num_tags = indices.len();
-            let num_points = num_tags * 5;
-            let mut points_pixel_copy: Vec<[f32; 2]> = Vec::with_capacity(num_points);
-            let mut point_to_local_index: Vec<usize> = Vec::with_capacity(num_points);
-            let mut point_type_copy: Vec<u8> = Vec::with_capacity(num_points);
-            for (local_idx, &global_idx) in indices.iter().enumerate() {
-                let tag = &tags[global_idx];
-                points_pixel_copy.push(tag.center_pixel);
-                point_to_local_index.push(local_idx);
-                point_type_copy.push(0);
-                for (c, &corner) in tag.corners_pixel.iter().enumerate() {
-                    points_pixel_copy.push(corner);
-                    point_to_local_index.push(local_idx);
-                    point_type_copy.push((c + 1) as u8);
-                }
-            }
-            camera_groups.push((*cam_id, indices.clone(), points_pixel_copy, point_to_local_index, point_type_copy));
-        }
-        let updates: Vec<(usize, Option<[f32; 2]>, Option<[[f32; 2]; 4]>)> = camera_groups.into_par_iter()
-            .map(|(cam_id, global_indices, points_pixel_copy, point_to_local_index, point_type_copy)| {
-                let points_real = self.convert_points(cam_id, &points_pixel_copy);
-                let num_tags = global_indices.len();
-                let mut centers: Vec<Option<[f32; 2]>> = vec![None; num_tags];
-                let mut corners: Vec<Option<[[f32; 2]; 4]>> = vec![None; num_tags];
-                for (i, &local_idx) in point_to_local_index.iter().enumerate() {
-                    let t = point_type_copy[i];
-                    let real = points_real[i];
-                    if t == 0 {
-                        centers[local_idx] = Some([real[0] as f32, real[1] as f32]);
-                    } else if t >= 1 && t <= 4 {
-                        if corners[local_idx].is_none() {
-                            corners[local_idx] = Some([[0.0; 2]; 4]);
-                        }
-                        corners[local_idx].as_mut().unwrap()[(t - 1) as usize] = [real[0] as f32, real[1] as f32];
-                    }
-                }
-                let mut result = Vec::with_capacity(num_tags);
-                for (local_idx, &global_idx) in global_indices.iter().enumerate() {
-                    let center = centers[local_idx];
-                    let corner = corners[local_idx];
-                    result.push((global_idx, center, corner));
-                }
-                result
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flatten()
-            .collect();
-        for (idx, center, corners) in updates {
-            if let Some(c) = center {
-                tags[idx].center_real = Some(c);
-            }
-            if let Some(c) = corners {
-                tags[idx].corners_real = Some(c);
-            }
+            items[idx].set_real_coords(center, corners);
         }
     }
 }
