@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use rayon::prelude::*;
 
 pub struct CameraCalibration {
     pub fx: f32,
@@ -79,30 +81,22 @@ impl HomographyManager {
 
 /// Converts pixel coordinates to real-world coordinates using undistortion and homography.
 pub struct CoordinateConverter {
-    pub undistortion_manager: UndistortionManager,
-    pub homography_manager: HomographyManager,
-    points_pixel_buffer: Vec<[f32; 2]>,
-    points_real_buffer: Vec<[f64; 2]>,
-    point_to_object_buffer: Vec<usize>,
-    point_kind_buffer: Vec<u8>,
+    pub undistortion_manager: Arc<UndistortionManager>,
+    pub homography_manager: Arc<HomographyManager>,
 }
 
 impl CoordinateConverter {
-    pub fn new() -> Self {
+    pub fn new(undistortion_manager: Arc<UndistortionManager>, homography_manager: Arc<HomographyManager>) -> Self {
         Self {
-            undistortion_manager: UndistortionManager::new(),
-            homography_manager: HomographyManager::new(),
-            points_pixel_buffer: Vec::new(),
-            points_real_buffer: Vec::new(),
-            point_to_object_buffer: Vec::new(),
-            point_kind_buffer: Vec::new(),
+            undistortion_manager,
+            homography_manager,
         }
     }
 
     /// Convert a batch of pixel points to real-world coordinates for a given camera.
-    pub fn convert_points(&mut self, camera_id: i32, points_pixel: &[[f32; 2]]) -> &[ [f64; 2] ] {
+    pub fn convert_points(&self, camera_id: i32, points_pixel: &[[f32; 2]]) -> Vec<[f64; 2]> {
         let undistorted = self.undistortion_manager.undistort_points(camera_id, points_pixel);
-        self.points_real_buffer.clear();
+        let mut points_real_buffer = Vec::with_capacity(undistorted.len());
         if let Some(h) = self.homography_manager.get_homography(camera_id) {
             for &pt in undistorted.iter() {
                 let x = pt[0] as f64;
@@ -113,48 +107,32 @@ impl CoordinateConverter {
                     proj[i] = h[i][0] * vec[0] + h[i][1] * vec[1] + h[i][2] * vec[2];
                 }
                 let z = if proj[2].abs() < 1e-10 { 1e-10 } else { proj[2] };
-                self.points_real_buffer.push([proj[0] / z, proj[1] / z]);
+                points_real_buffer.push([proj[0] / z, proj[1] / z]);
             }
         } else {
             for &pt in undistorted.iter() {
-                self.points_real_buffer.push([pt[0] as f64, pt[1] as f64]);
+                points_real_buffer.push([pt[0] as f64, pt[1] as f64]);
             }
         }
-        &self.points_real_buffer[..]
+        points_real_buffer
     }
 
-    fn ensure_buffer_capacity(&mut self, max_points: usize) {
-        if self.points_pixel_buffer.len() < max_points {
-            self.points_pixel_buffer.resize(max_points, [0.0; 2]);
-        }
-        if self.points_real_buffer.len() < max_points {
-            self.points_real_buffer.resize(max_points, [0.0; 2]);
-        }
-        if self.point_to_object_buffer.len() < max_points {
-            self.point_to_object_buffer.resize(max_points, 0);
-        }
-        if self.point_kind_buffer.len() < max_points {
-            self.point_kind_buffer.resize(max_points, 0);
-        }
-    }
-
-
-    /// Convert all objects' pixel coordinates to real-world coordinates, grouped by camera.
-    pub fn convert_batch_objects(&mut self, objects: &mut [crate::ObjectData]) {
+    /// Parallel conversion for all objects' pixel coordinates to real-world coordinates, grouped by camera.
+    pub fn convert_batch_objects(&self, objects: &mut [crate::ObjectData]) {
         use std::collections::HashMap;
+        // Step 1: Prepare pixel data for each camera group
+        let mut camera_groups: Vec<(i32, Vec<usize>, Vec<[f32; 2]>, Vec<usize>, Vec<u8>)> = Vec::new();
         let mut camera_indices: HashMap<i32, Vec<usize>> = HashMap::new();
         for (i, obj) in objects.iter().enumerate() {
             camera_indices.entry(obj.camera_id).or_default().push(i);
         }
-        for (cam_id, indices) in camera_indices {
+        for (cam_id, indices) in camera_indices.iter() {
             let num_objects = indices.len();
             let num_points = num_objects * 5;
-            self.ensure_buffer_capacity(num_points);
-            // Copy pixel points, object indices, and types out before calling convert_points
             let mut points_pixel_copy: Vec<[f32; 2]> = Vec::with_capacity(num_points);
             let mut point_to_object_copy: Vec<usize> = Vec::with_capacity(num_points);
             let mut point_type_copy: Vec<u8> = Vec::with_capacity(num_points);
-            for &idx in &indices {
+            for &idx in indices {
                 let obj = &objects[idx];
                 points_pixel_copy.push(obj.center_pixel);
                 point_to_object_copy.push(idx);
@@ -165,42 +143,61 @@ impl CoordinateConverter {
                     point_type_copy.push((c + 1) as u8);
                 }
             }
-            let points_real = self.convert_points(cam_id, &points_pixel_copy);
-            for (i, &obj_idx) in point_to_object_copy.iter().enumerate() {
-                let t = point_type_copy[i];
-                let real = points_real[i];
-                let obj = &mut objects[obj_idx];
-                if t == 0 {
-                    obj.center_real = Some([real[0] as f32, real[1] as f32]);
-                } else if t >= 1 && t <= 4 {
-                    if let Some(ref mut corners) = obj.corners_real {
-                        corners[(t - 1) as usize] = [real[0] as f32, real[1] as f32];
-                    } else {
-                        let mut arr = [[0.0; 2]; 4];
-                        arr[(t - 1) as usize] = [real[0] as f32, real[1] as f32];
-                        obj.corners_real = Some(arr);
+            camera_groups.push((*cam_id, indices.clone(), points_pixel_copy, point_to_object_copy, point_type_copy));
+        }
+        // Step 2: Parallel conversion
+        let updates: Vec<(usize, Option<[f32; 2]>, Option<[[f32; 2]; 4]>)> = camera_groups.into_par_iter()
+            .map(|(cam_id, indices, points_pixel_copy, point_to_object_copy, point_type_copy)| {
+                let points_real = self.convert_points(cam_id, &points_pixel_copy);
+                let mut result = Vec::new();
+                let mut center_map: HashMap<usize, [f32; 2]> = HashMap::new();
+                let mut corners_map: HashMap<usize, [[f32; 2]; 4]> = HashMap::new();
+                for (i, &obj_idx) in point_to_object_copy.iter().enumerate() {
+                    let t = point_type_copy[i];
+                    let real = points_real[i];
+                    if t == 0 {
+                        center_map.insert(obj_idx, [real[0] as f32, real[1] as f32]);
+                    } else if t >= 1 && t <= 4 {
+                        corners_map.entry(obj_idx).or_insert([[0.0; 2]; 4])[(t - 1) as usize] = [real[0] as f32, real[1] as f32];
                     }
                 }
+                for idx in indices {
+                    let center = center_map.get(&idx).cloned();
+                    let corners = corners_map.get(&idx).cloned();
+                    result.push((idx, center, corners));
+                }
+                result
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect();
+        // Step 3: Sequentially apply updates
+        for (idx, center, corners) in updates {
+            if let Some(c) = center {
+                objects[idx].center_real = Some(c);
+            }
+            if let Some(c) = corners {
+                objects[idx].corners_real = Some(c);
             }
         }
     }
 
-    /// Convert all AprilTag pixel coordinates to real-world coordinates, grouped by camera.
-    pub fn convert_batch_apriltags(&mut self, tags: &mut [crate::AprilTagData]) {
+    /// Parallel conversion for all AprilTag pixel coordinates to real-world coordinates, grouped by camera.
+    pub fn convert_batch_apriltags(&self, tags: &mut [crate::AprilTagData]) {
         use std::collections::HashMap;
+        let mut camera_groups: Vec<(i32, Vec<usize>, Vec<[f32; 2]>, Vec<usize>, Vec<u8>)> = Vec::new();
         let mut camera_indices: HashMap<i32, Vec<usize>> = HashMap::new();
         for (i, tag) in tags.iter().enumerate() {
             camera_indices.entry(tag.camera_id).or_default().push(i);
         }
-        for (cam_id, indices) in camera_indices {
+        for (cam_id, indices) in camera_indices.iter() {
             let num_tags = indices.len();
             let num_points = num_tags * 5;
-            self.ensure_buffer_capacity(num_points);
-            // Copy pixel points, tag indices, and types out before calling convert_points
             let mut points_pixel_copy: Vec<[f32; 2]> = Vec::with_capacity(num_points);
             let mut point_to_tag_copy: Vec<usize> = Vec::with_capacity(num_points);
             let mut point_type_copy: Vec<u8> = Vec::with_capacity(num_points);
-            for &idx in &indices {
+            for &idx in indices {
                 let tag = &tags[idx];
                 points_pixel_copy.push(tag.center_pixel);
                 point_to_tag_copy.push(idx);
@@ -211,23 +208,42 @@ impl CoordinateConverter {
                     point_type_copy.push((c + 1) as u8);
                 }
             }
-            let points_real = self.convert_points(cam_id, &points_pixel_copy);
-            for (i, &tag_idx) in point_to_tag_copy.iter().enumerate() {
-                let t = point_type_copy[i];
-                let real = points_real[i];
-                let tag = &mut tags[tag_idx];
-                if t == 0 {
-                    tag.center_real = Some([real[0] as f32, real[1] as f32]);
-                } else if t >= 1 && t <= 4 {
-                    if let Some(ref mut corners) = tag.corners_real {
-                        corners[(t - 1) as usize] = [real[0] as f32, real[1] as f32];
-                    } else {
-                        let mut arr = [[0.0; 2]; 4];
-                        arr[(t - 1) as usize] = [real[0] as f32, real[1] as f32];
-                        tag.corners_real = Some(arr);
+            camera_groups.push((*cam_id, indices.clone(), points_pixel_copy, point_to_tag_copy, point_type_copy));
+        }
+        let updates: Vec<(usize, Option<[f32; 2]>, Option<[[f32; 2]; 4]>)> = camera_groups.into_par_iter()
+            .map(|(cam_id, indices, points_pixel_copy, point_to_tag_copy, point_type_copy)| {
+                let points_real = self.convert_points(cam_id, &points_pixel_copy);
+                let mut result = Vec::new();
+                let mut center_map: HashMap<usize, [f32; 2]> = HashMap::new();
+                let mut corners_map: HashMap<usize, [[f32; 2]; 4]> = HashMap::new();
+                for (i, &tag_idx) in point_to_tag_copy.iter().enumerate() {
+                    let t = point_type_copy[i];
+                    let real = points_real[i];
+                    if t == 0 {
+                        center_map.insert(tag_idx, [real[0] as f32, real[1] as f32]);
+                    } else if t >= 1 && t <= 4 {
+                        corners_map.entry(tag_idx).or_insert([[0.0; 2]; 4])[(t - 1) as usize] = [real[0] as f32, real[1] as f32];
                     }
                 }
+                for idx in indices {
+                    let center = center_map.get(&idx).cloned();
+                    let corners = corners_map.get(&idx).cloned();
+                    result.push((idx, center, corners));
+                }
+                result
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect();
+        for (idx, center, corners) in updates {
+            if let Some(c) = center {
+                tags[idx].center_real = Some(c);
+            }
+            if let Some(c) = corners {
+                tags[idx].corners_real = Some(c);
             }
         }
     }
 }
+
