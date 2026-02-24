@@ -96,25 +96,24 @@ impl CoordinateConverter {
     /// Convert a batch of pixel points to real-world coordinates for a given camera.
     pub fn convert_points(&self, camera_id: i32, points_pixel: &[[f32; 2]]) -> Vec<[f64; 2]> {
         let undistorted = self.undistortion_manager.undistort_points(camera_id, points_pixel);
-        let mut points_real_buffer = Vec::with_capacity(undistorted.len());
         if let Some(h) = self.homography_manager.get_homography(camera_id) {
-            for &pt in undistorted.iter() {
-                let x = pt[0] as f64;
-                let y = pt[1] as f64;
-                let vec = [x, y, 1.0];
-                let mut proj = [0.0; 3];
-                for i in 0..3 {
-                    proj[i] = h[i][0] * vec[0] + h[i][1] * vec[1] + h[i][2] * vec[2];
-                }
-                let z = if proj[2].abs() < 1e-10 { 1e-10 } else { proj[2] };
-                points_real_buffer.push([proj[0] / z, proj[1] / z]);
-            }
+            use rayon::prelude::*;
+            undistorted.par_iter()
+                .map(|pt| {
+                    let x = pt[0] as f64;
+                    let y = pt[1] as f64;
+                    let vec = [x, y, 1.0];
+                    let mut proj = [0.0; 3];
+                    for i in 0..3 {
+                        proj[i] = h[i][0] * vec[0] + h[i][1] * vec[1] + h[i][2] * vec[2];
+                    }
+                    let z = if proj[2].abs() < 1e-10 { 1e-10 } else { proj[2] };
+                    [proj[0] / z, proj[1] / z]
+                })
+                .collect()
         } else {
-            for &pt in undistorted.iter() {
-                points_real_buffer.push([pt[0] as f64, pt[1] as f64]);
-            }
+            undistorted.iter().map(|pt| [pt[0] as f64, pt[1] as f64]).collect()
         }
-        points_real_buffer
     }
 
     /// Parallel conversion for all objects' pixel coordinates to real-world coordinates, grouped by camera.

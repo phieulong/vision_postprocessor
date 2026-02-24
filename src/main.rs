@@ -84,7 +84,7 @@ impl MessagePipeline {
         // This is a placeholder for actual extraction logic
         let matrices = [];
         let points = [];
-        let converted = crate::modules::coordinate_converter::batch_homography_all_cameras(&matrices, &points);
+        let converted = batch_homography_all_cameras(&matrices, &points);
         self
     }
 
