@@ -1,6 +1,7 @@
 use deadpool_redis::{Config, Pool, Runtime};
 use redis::AsyncCommands;
 use std::sync::Arc;
+use log::info;
 
 #[derive(Clone)]
 pub struct RedisPool {
@@ -9,10 +10,10 @@ pub struct RedisPool {
 
 impl RedisPool {
     pub async fn new(url: &str) -> Self {
-        let mut cfg = Config::default();
-        cfg.url = Some(url.to_string());
-        cfg.pool = Some(deadpool_redis::PoolConfig::default());
-        let pool = cfg.create_pool(Some(Runtime::Tokio1)).unwrap();
+        info!("Initializing Redis pool with URL: {}", url);
+        let cfg = Config::from_url(url);
+        let pool = cfg.create_pool(Some(Runtime::Tokio1)).expect("Failed to create Redis pool");
+        info!("Redis pool created successfully");
         Self { pool: Arc::new(pool) }
     }
 

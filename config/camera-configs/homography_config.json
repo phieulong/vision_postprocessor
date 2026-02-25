@@ -1,0 +1,18 @@
+[
+    {
+        "camera_id": 8555,
+        "homography_path": "config/camera-configs/cam_matrix/homography_data_8555.npy"
+    },
+    {
+        "camera_id": 8557,
+        "homography_path": "config/camera-configs/cam_matrix/homography_data_8557.npy"
+    },
+    {
+        "camera_id": 8558,
+        "homography_path": "config/camera-configs/cam_matrix/homography_data_8558.npy"
+    },
+    {
+        "camera_id": 8559,
+        "homography_path": "config/camera-configs/cam_matrix/homography_data_8559.npy"
+    }
+]

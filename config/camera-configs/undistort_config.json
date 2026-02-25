@@ -1,0 +1,22 @@
+[
+    {
+        "camera_id": 8555,
+        "camera_matrix_path": "config/camera-configs/cam_parameters/camera_matrix.npy",
+        "dist_coeffs_path": "config/camera-configs/cam_parameters/dist_coeffs.npy"
+    },
+    {
+        "camera_id": 8557,
+        "camera_matrix_path": "config/camera-configs/cam_parameters/camera_matrix.npy",
+        "dist_coeffs_path": "config/camera-configs/cam_parameters/dist_coeffs.npy"
+    },
+    {
+        "camera_id": 8558,
+        "camera_matrix_path": "config/camera-configs/cam_parameters/camera_matrix.npy",
+        "dist_coeffs_path": "config/camera-configs/cam_parameters/dist_coeffs.npy"
+    },
+    {
+        "camera_id": 8559,
+        "camera_matrix_path": "config/camera-configs/cam_parameters/camera_matrix.npy",
+        "dist_coeffs_path": "config/camera-configs/cam_parameters/dist_coeffs.npy"
+    }
+]

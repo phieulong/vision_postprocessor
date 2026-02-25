@@ -4,9 +4,10 @@ use rayon::prelude::*;
 use std::error::Error;
 use std::fs::File;
 use std::path::Path;
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayD};
 use ndarray_npy::read_npy;
 use serde::Deserialize;
+use log::info;
 
 pub struct CameraCalibration {
     pub fx: f32,
@@ -93,22 +94,32 @@ impl UndistortionManager {
     /// Load undistortion configuration from a JSON file listing camera entries and loading camera matrix and dist coeffs from .npy files.
     /// JSON format: [{"camera_id":0,"camera_matrix_path":"/path/camera_matrix.npy","dist_coeffs_path":"/path/dist_coeffs.npy"}, ...]
     pub fn from_npy_config<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn Error>> {
-        let file = File::open(path)?;
+        let path_ref = path.as_ref();
+        info!("Loading undistortion config from {:?}", path_ref);
+        let file = File::open(path_ref)?;
         let entries: Vec<UndistortionEntry> = serde_json::from_reader(file)?;
         let mut mgr = UndistortionManager::new();
         for entry in entries {
-            // read 3x3 camera matrix
-            let cm_array: Array2<f64> = read_npy(entry.camera_matrix_path.clone())?;
-            if cm_array.len() != 9 {
-                return Err(format!("camera_matrix at {} is not 3x3", entry.camera_matrix_path).into());
-            }
-            let cm = cm_array;
+            info!("  - Processing camera_id {} (matrix: {:?}, dist: {:?})", entry.camera_id, entry.camera_matrix_path, entry.dist_coeffs_path);
+            // read camera matrix and ensure it's 3x3
+            let cm_any: ArrayD<f64> = read_npy(&entry.camera_matrix_path)?;
+            let cm: Array2<f64> = if cm_any.ndim() == 2 && cm_any.shape() == [3, 3] {
+                cm_any.into_dimensionality::<ndarray::Ix2>()?
+            } else if cm_any.len() == 9 {
+                cm_any.into_shape((3, 3))?.into_dimensionality::<ndarray::Ix2>()?
+            } else {
+                return Err(format!("camera_matrix at {} has invalid shape {:?} (expected 3x3)", entry.camera_matrix_path, cm_any.shape()).into());
+            };
             // read dist coeffs (assume length >= 5)
-            let dist_array: Array1<f64> = read_npy(entry.dist_coeffs_path.clone())?;
-            if dist_array.len() < 5 {
-                return Err(format!("dist_coeffs at {} has length < 5", entry.dist_coeffs_path).into());
-            }
-            let dist = dist_array;
+            let dist_any: ArrayD<f64> = read_npy(&entry.dist_coeffs_path)?;
+            let dist: Array1<f64> = if dist_any.ndim() == 1 && dist_any.len() >= 5 {
+                dist_any.into_dimensionality::<ndarray::Ix1>()?
+            } else if dist_any.len() >= 5 {
+                let n = dist_any.len();
+                dist_any.into_shape(n)?.into_dimensionality::<ndarray::Ix1>()?
+            } else {
+                return Err(format!("dist_coeffs at {} has length < 5 (shape {:?})", entry.dist_coeffs_path, dist_any.shape()).into());
+            };
             // populate CameraCalibration: map values and set projection to same as camera matrix by default
             let fx = cm[[0,0]] as f32;
             let fy = cm[[1,1]] as f32;
@@ -157,15 +168,21 @@ impl HomographyManager {
 
     /// Load homography config (JSON array of objects with camera_id and homography_path) and read .npy matrices.
     pub fn from_npy_config<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn Error>> {
-        let file = File::open(path)?;
+        let path_ref = path.as_ref();
+        info!("Loading homography config from {:?}", path_ref);
+        let file = File::open(path_ref)?;
         let entries: Vec<HomographyEntry> = serde_json::from_reader(file)?;
         let mut mgr = HomographyManager::new();
         for entry in entries {
-            let hm_array: Array2<f64> = read_npy(entry.homography_path.clone())?;
-            if hm_array.len() != 9 {
-                return Err(format!("homography at {} is not 3x3", entry.homography_path).into());
-            }
-            let hm = hm_array;
+            info!("  - Processing camera_id {} (homography: {:?})", entry.camera_id, entry.homography_path);
+            let hm_any: ArrayD<f64> = read_npy(&entry.homography_path)?;
+            let hm: Array2<f64> = if hm_any.ndim() == 2 && hm_any.shape() == [3, 3] {
+                hm_any.into_dimensionality::<ndarray::Ix2>()?
+            } else if hm_any.len() == 9 {
+                hm_any.into_shape((3, 3))?.into_dimensionality::<ndarray::Ix2>()?
+            } else {
+                return Err(format!("homography at {} has invalid shape {:?} (expected 3x3)", entry.homography_path, hm_any.shape()).into());
+            };
             let mut mat = [[0.0f64; 3]; 3];
             for i in 0..3 {
                 for j in 0..3 {
@@ -296,4 +313,5 @@ impl CoordinateConverter {
         }
     }
 }
+
 
