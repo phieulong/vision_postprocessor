@@ -1,6 +1,6 @@
 mod redis_pool;
 mod modules;
-use crate::modules::coordinate_converter_v2::CoordinateConverter;
+use crate::modules::coordinate_converter::CoordinateConverter;
 
 use redis_pool::RedisPool;
 use std::sync::Arc;
